@@ -16,11 +16,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"html/template"
-	"io"
 	"io/ioutil"
 	"math/big"
 	"net/http"
@@ -40,38 +36,6 @@ var (
 	exampleCertKey    = certKey{domain: exampleDomain}
 	exampleCertKeyRSA = certKey{domain: exampleDomain, isRSA: true}
 )
-
-var discoTmpl = template.Must(template.New("disco").Parse(`{
-	"new-reg": "{{.}}/new-reg",
-	"new-authz": "{{.}}/new-authz",
-	"new-cert": "{{.}}/new-cert"
-}`))
-
-var authzTmpl = template.Must(template.New("authz").Parse(`{
-	"status": "pending",
-	"challenges": [
-		{
-			"uri": "{{.}}/challenge/1",
-			"type": "tls-sni-01",
-			"token": "token-01"
-		},
-		{
-			"uri": "{{.}}/challenge/2",
-			"type": "tls-sni-02",
-			"token": "token-02"
-		},
-		{
-			"uri": "{{.}}/challenge/dns-01",
-			"type": "dns-01",
-			"token": "token-dns-01"
-		},
-		{
-			"uri": "{{.}}/challenge/http-01",
-			"type": "http-01",
-			"token": "token-http-01"
-		}
-	]
-}`))
 
 type memCache struct {
 	t       *testing.T
@@ -159,7 +123,7 @@ func dateDummyCert(pub interface{}, start, end time.Time, san ...string) ([]byte
 		return nil, err
 	}
 	t := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
+		SerialNumber:          randomSerial(),
 		NotBefore:             start,
 		NotAfter:              end,
 		BasicConstraintsValid: true,
@@ -172,105 +136,351 @@ func dateDummyCert(pub interface{}, start, end time.Time, san ...string) ([]byte
 	return x509.CreateCertificate(rand.Reader, t, t, pub, key)
 }
 
-func decodePayload(v interface{}, r io.Reader) error {
-	var req struct{ Payload string }
-	if err := json.NewDecoder(r).Decode(&req); err != nil {
-		return err
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(req.Payload)
+func randomSerial() *big.Int {
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 32))
 	if err != nil {
-		return err
+		panic(err)
 	}
-	return json.Unmarshal(payload, v)
+	return serial
 }
 
-func clientHelloInfo(sni string, ecdsaSupport bool) *tls.ClientHelloInfo {
+type algorithmSupport int
+
+const (
+	algRSA algorithmSupport = iota
+	algECDSA
+)
+
+func clientHelloInfo(sni string, alg algorithmSupport) *tls.ClientHelloInfo {
 	hello := &tls.ClientHelloInfo{
 		ServerName:   sni,
 		CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305},
 	}
-	if ecdsaSupport {
+	if alg == algECDSA {
 		hello.CipherSuites = append(hello.CipherSuites, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305)
 	}
 	return hello
 }
 
-func TestGetCertificate(t *testing.T) {
-	man := &Manager{Prompt: AcceptTOS}
-	defer man.stopRenew()
-	hello := clientHelloInfo("example.org", true)
-	testGetCertificate(t, man, "example.org", hello)
-}
-
-func TestGetCertificate_trailingDot(t *testing.T) {
-	man := &Manager{Prompt: AcceptTOS}
-	defer man.stopRenew()
-	hello := clientHelloInfo("example.org.", true)
-	testGetCertificate(t, man, "example.org", hello)
-}
-
-func TestGetCertificate_ForceRSA(t *testing.T) {
+func testManager(t *testing.T) *Manager {
 	man := &Manager{
-		Prompt:   AcceptTOS,
-		Cache:    newMemCache(t),
-		ForceRSA: true,
+		Prompt: AcceptTOS,
+		Cache:  newMemCache(t),
 	}
-	defer man.stopRenew()
-	hello := clientHelloInfo(exampleDomain, true)
-	testGetCertificate(t, man, exampleDomain, hello)
-
-	// ForceRSA was deprecated and is now ignored.
-	cert, err := man.cacheGet(context.Background(), exampleCertKey)
-	if err != nil {
-		t.Fatalf("man.cacheGet: %v", err)
-	}
-	if _, ok := cert.PrivateKey.(*ecdsa.PrivateKey); !ok {
-		t.Errorf("cert.PrivateKey is %T; want *ecdsa.PrivateKey", cert.PrivateKey)
-	}
+	t.Cleanup(man.stopRenew)
+	return man
 }
 
-func TestGetCertificate_nilPrompt(t *testing.T) {
-	man := &Manager{}
-	defer man.stopRenew()
-	url, finish := startACMEServerStub(t, getCertificateFromManager(man, true), "example.org")
-	defer finish()
-	man.Client = &acme.Client{DirectoryURL: url}
-	hello := clientHelloInfo("example.org", true)
-	if _, err := man.GetCertificate(hello); err == nil {
-		t.Error("got certificate for example.org; wanted error")
-	}
-}
+func TestGetCertificate(t *testing.T) {
+	tests := []struct {
+		name        string
+		hello       *tls.ClientHelloInfo
+		domain      string
+		expectError string
+		prepare     func(t *testing.T, man *Manager, s *acmetest.CAServer)
+		verify      func(t *testing.T, man *Manager, leaf *x509.Certificate)
+		disableALPN bool
+		disableHTTP bool
+	}{
+		{
+			name:        "ALPN",
+			hello:       clientHelloInfo("example.org", algECDSA),
+			domain:      "example.org",
+			disableHTTP: true,
+		},
+		{
+			name:        "HTTP",
+			hello:       clientHelloInfo("example.org", algECDSA),
+			domain:      "example.org",
+			disableALPN: true,
+		},
+		{
+			name:   "nilPrompt",
+			hello:  clientHelloInfo("example.org", algECDSA),
+			domain: "example.org",
+			prepare: func(t *testing.T, man *Manager, s *acmetest.CAServer) {
+				man.Prompt = nil
+			},
+			expectError: "Manager.Prompt not set",
+		},
+		{
+			name:   "trailingDot",
+			hello:  clientHelloInfo("example.org.", algECDSA),
+			domain: "example.org",
+		},
+		{
+			name:   "unicodeIDN",
+			hello:  clientHelloInfo("éé.com", algECDSA),
+			domain: "xn--9caa.com",
+		},
+		{
+			name:   "unicodeIDN/mixedCase",
+			hello:  clientHelloInfo("éÉ.com", algECDSA),
+			domain: "xn--9caa.com",
+		},
+		{
+			name:   "upperCase",
+			hello:  clientHelloInfo("EXAMPLE.ORG", algECDSA),
+			domain: "example.org",
+		},
+		{
+			name:   "goodCache",
+			hello:  clientHelloInfo("example.org", algECDSA),
+			domain: "example.org",
+			prepare: func(t *testing.T, man *Manager, s *acmetest.CAServer) {
+				// Make a valid cert and cache it.
+				c := s.Start().LeafCert(exampleDomain, "ECDSA",
+					// Use a time before the Let's Encrypt revocation cutoff to also test
+					// that non-Let's Encrypt certificates are not renewed.
+					time.Date(2022, time.January, 1, 0, 0, 0, 0, time.UTC),
+					time.Date(2122, time.January, 1, 0, 0, 0, 0, time.UTC),
+				)
+				if err := man.cachePut(context.Background(), exampleCertKey, c); err != nil {
+					t.Fatalf("man.cachePut: %v", err)
+				}
+			},
+			// Break the server to check that the cache is used.
+			disableALPN: true, disableHTTP: true,
+		},
+		{
+			name:   "expiredCache",
+			hello:  clientHelloInfo("example.org", algECDSA),
+			domain: "example.org",
+			prepare: func(t *testing.T, man *Manager, s *acmetest.CAServer) {
+				// Make an expired cert and cache it.
+				c := s.Start().LeafCert(exampleDomain, "ECDSA", time.Now().Add(-10*time.Minute), time.Now().Add(-5*time.Minute))
+				if err := man.cachePut(context.Background(), exampleCertKey, c); err != nil {
+					t.Fatalf("man.cachePut: %v", err)
+				}
+			},
+		},
+		{
+			name:   "forceRSA",
+			hello:  clientHelloInfo("example.org", algECDSA),
+			domain: "example.org",
+			prepare: func(t *testing.T, man *Manager, s *acmetest.CAServer) {
+				man.ForceRSA = true
+			},
+			verify: func(t *testing.T, man *Manager, leaf *x509.Certificate) {
+				if _, ok := leaf.PublicKey.(*ecdsa.PublicKey); !ok {
+					t.Errorf("leaf.PublicKey is %T; want *ecdsa.PublicKey", leaf.PublicKey)
+				}
+			},
+		},
+		{
+			name:   "goodLetsEncrypt",
+			hello:  clientHelloInfo("example.org", algECDSA),
+			domain: "example.org",
+			prepare: func(t *testing.T, man *Manager, s *acmetest.CAServer) {
+				// Make a valid certificate issued after the TLS-ALPN-01
+				// revocation window and cache it.
+				s.IssuerName(pkix.Name{Country: []string{"US"},
+					Organization: []string{"Let's Encrypt"}, CommonName: "R3"})
+				c := s.Start().LeafCert(exampleDomain, "ECDSA",
+					time.Date(2022, time.January, 26, 12, 0, 0, 0, time.UTC),
+					time.Date(2122, time.January, 1, 0, 0, 0, 0, time.UTC),
+				)
+				if err := man.cachePut(context.Background(), exampleCertKey, c); err != nil {
+					t.Fatalf("man.cachePut: %v", err)
+				}
+			},
+			// Break the server to check that the cache is used.
+			disableALPN: true, disableHTTP: true,
+		},
+		{
+			name:   "revokedLetsEncrypt",
+			hello:  clientHelloInfo("example.org", algECDSA),
+			domain: "example.org",
+			prepare: func(t *testing.T, man *Manager, s *acmetest.CAServer) {
+				// Make a certificate issued during the TLS-ALPN-01
+				// revocation window and cache it.
+				s.IssuerName(pkix.Name{Country: []string{"US"},
+					Organization: []string{"Let's Encrypt"}, CommonName: "R3"})
+				c := s.Start().LeafCert(exampleDomain, "ECDSA",
+					time.Date(2022, time.January, 1, 0, 0, 0, 0, time.UTC),
+					time.Date(2122, time.January, 1, 0, 0, 0, 0, time.UTC),
+				)
+				if err := man.cachePut(context.Background(), exampleCertKey, c); err != nil {
+					t.Fatalf("man.cachePut: %v", err)
+				}
+			},
+			verify: func(t *testing.T, man *Manager, leaf *x509.Certificate) {
+				if leaf.NotBefore.Before(time.Now().Add(-10 * time.Minute)) {
+					t.Error("certificate was not reissued")
+				}
+			},
+		},
+		{
+			// TestGetCertificate/tokenCache tests the fallback of token
+			// certificate fetches to cache when Manager.certTokens misses.
+			name:   "tokenCacheALPN",
+			hello:  clientHelloInfo("example.org", algECDSA),
+			domain: "example.org",
+			prepare: func(t *testing.T, man *Manager, s *acmetest.CAServer) {
+				// Make a separate manager with a shared cache, simulating
+				// separate nodes that serve requests for the same domain.
+				man2 := testManager(t)
+				man2.Cache = man.Cache
+				// Redirect the verification request to man2, although the
+				// client request will hit man, testing that they can complete a
+				// verification by communicating through the cache.
+				s.ResolveGetCertificate("example.org", man2.GetCertificate)
+			},
+			// Drop the default verification paths.
+			disableALPN: true,
+		},
+		{
+			name:   "tokenCacheHTTP",
+			hello:  clientHelloInfo("example.org", algECDSA),
+			domain: "example.org",
+			prepare: func(t *testing.T, man *Manager, s *acmetest.CAServer) {
+				man2 := testManager(t)
+				man2.Cache = man.Cache
+				s.ResolveHandler("example.org", man2.HTTPHandler(nil))
+			},
+			disableHTTP: true,
+		},
+		{
+			name:   "ecdsa",
+			hello:  clientHelloInfo("example.org", algECDSA),
+			domain: "example.org",
+			verify: func(t *testing.T, man *Manager, leaf *x509.Certificate) {
+				if _, ok := leaf.PublicKey.(*ecdsa.PublicKey); !ok {
+					t.Error("an ECDSA client was served a non-ECDSA certificate")
+				}
+			},
+		},
+		{
+			name:   "rsa",
+			hello:  clientHelloInfo("example.org", algRSA),
+			domain: "example.org",
+			verify: func(t *testing.T, man *Manager, leaf *x509.Certificate) {
+				if _, ok := leaf.PublicKey.(*rsa.PublicKey); !ok {
+					t.Error("an RSA client was served a non-RSA certificate")
+				}
+			},
+		},
+		{
+			name:   "wrongCacheKeyType",
+			hello:  clientHelloInfo("example.org", algECDSA),
+			domain: "example.org",
+			prepare: func(t *testing.T, man *Manager, s *acmetest.CAServer) {
+				// Make an RSA cert and cache it without suffix.
+				c := s.Start().LeafCert(exampleDomain, "RSA", time.Now(), time.Now().Add(90*24*time.Hour))
+				if err := man.cachePut(context.Background(), exampleCertKey, c); err != nil {
+					t.Fatalf("man.cachePut: %v", err)
+				}
+			},
+			verify: func(t *testing.T, man *Manager, leaf *x509.Certificate) {
+				// The RSA cached cert should be silently ignored and replaced.
+				if _, ok := leaf.PublicKey.(*ecdsa.PublicKey); !ok {
+					t.Error("an ECDSA client was served a non-ECDSA certificate")
+				}
+				if numCerts := man.Cache.(*memCache).numCerts(); numCerts != 1 {
+					t.Errorf("found %d certificates in cache; want %d", numCerts, 1)
+				}
+			},
+		},
+		{
+			name:   "expiredCache",
+			hello:  clientHelloInfo("example.org", algECDSA),
+			domain: "example.org",
+			prepare: func(t *testing.T, man *Manager, s *acmetest.CAServer) {
+				man.RenewBefore = 24 * time.Hour
+				// Cache an almost expired cert.
+				c := s.Start().LeafCert(exampleDomain, "ECDSA", time.Now(), time.Now().Add(10*time.Minute))
+				if err := man.cachePut(context.Background(), exampleCertKey, c); err != nil {
+					t.Fatalf("man.cachePut: %v", err)
+				}
+			},
+		},
+		{
+			name:   "provideExternalAuth",
+			hello:  clientHelloInfo("example.org", algECDSA),
+			domain: "example.org",
+			prepare: func(t *testing.T, man *Manager, s *acmetest.CAServer) {
+				s.ExternalAccountRequired()
 
-func TestGetCertificate_expiredCache(t *testing.T) {
-	// Make an expired cert and cache it.
-	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
+				man.ExternalAccountBinding = &acme.ExternalAccountBinding{
+					KID: "test-key",
+					Key: make([]byte, 32),
+				}
+			},
+		},
 	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: exampleDomain},
-		NotAfter:     time.Now(),
-	}
-	pub, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &pk.PublicKey, pk)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tlscert := &tls.Certificate{
-		Certificate: [][]byte{pub},
-		PrivateKey:  pk,
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			man := testManager(t)
+			s := acmetest.NewCAServer(t)
+			if !tt.disableALPN {
+				s.ResolveGetCertificate(tt.domain, man.GetCertificate)
+			}
+			if !tt.disableHTTP {
+				s.ResolveHandler(tt.domain, man.HTTPHandler(nil))
+			}
 
-	man := &Manager{Prompt: AcceptTOS, Cache: newMemCache(t)}
-	defer man.stopRenew()
-	if err := man.cachePut(context.Background(), exampleCertKey, tlscert); err != nil {
-		t.Fatalf("man.cachePut: %v", err)
-	}
+			if tt.prepare != nil {
+				tt.prepare(t, man, s)
+			}
 
-	// The expired cached cert should trigger a new cert issuance
-	// and return without an error.
-	hello := clientHelloInfo(exampleDomain, true)
-	testGetCertificate(t, man, exampleDomain, hello)
+			s.Start()
+
+			man.Client = &acme.Client{DirectoryURL: s.URL()}
+
+			var tlscert *tls.Certificate
+			var err error
+			done := make(chan struct{})
+			go func() {
+				tlscert, err = man.GetCertificate(tt.hello)
+				close(done)
+			}()
+			select {
+			case <-time.After(time.Minute):
+				t.Fatal("man.GetCertificate took too long to return")
+			case <-done:
+			}
+			if tt.expectError != "" {
+				if err == nil {
+					t.Fatal("expected error, got certificate")
+				}
+				if !strings.Contains(err.Error(), tt.expectError) {
+					t.Errorf("got %q, expected %q", err, tt.expectError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("man.GetCertificate: %v", err)
+			}
+
+			leaf, err := x509.ParseCertificate(tlscert.Certificate[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts := x509.VerifyOptions{
+				DNSName:       tt.domain,
+				Intermediates: x509.NewCertPool(),
+				Roots:         s.Roots(),
+			}
+			for _, cert := range tlscert.Certificate[1:] {
+				c, err := x509.ParseCertificate(cert)
+				if err != nil {
+					t.Fatal(err)
+				}
+				opts.Intermediates.AddCert(c)
+			}
+			if _, err := leaf.Verify(opts); err != nil {
+				t.Error(err)
+			}
+
+			if san := leaf.DNSNames[0]; san != tt.domain {
+				t.Errorf("got SAN %q, expected %q", san, tt.domain)
+			}
+
+			if tt.verify != nil {
+				tt.verify(t, man, leaf)
+			}
+		})
+	}
 }
 
 func TestGetCertificate_failedAttempt(t *testing.T) {
@@ -301,7 +511,7 @@ func TestGetCertificate_failedAttempt(t *testing.T) {
 		},
 	}
 	defer man.stopRenew()
-	hello := clientHelloInfo(exampleDomain, true)
+	hello := clientHelloInfo(exampleDomain, algECDSA)
 	if _, err := man.GetCertificate(hello); err == nil {
 		t.Error("GetCertificate: err is nil")
 	}
@@ -317,480 +527,34 @@ func TestGetCertificate_failedAttempt(t *testing.T) {
 	}
 }
 
-// testGetCertificate_tokenCache tests the fallback of token certificate fetches
-// to cache when Manager.certTokens misses. ecdsaSupport refers to the CA when
-// verifying the certificate token.
-func testGetCertificate_tokenCache(t *testing.T, ecdsaSupport bool) {
-	man1 := &Manager{
-		Cache:  newMemCache(t),
-		Prompt: AcceptTOS,
-	}
-	defer man1.stopRenew()
-	man2 := &Manager{
-		Cache:  man1.Cache,
-		Prompt: AcceptTOS,
-	}
-	defer man2.stopRenew()
-
-	// Send the verification request to a different Manager from the one that
-	// initiated the authorization, when they share caches.
-	url, finish := startACMEServerStub(t, getCertificateFromManager(man2, ecdsaSupport), "example.org")
-	defer finish()
-	man1.Client = &acme.Client{DirectoryURL: url}
-	hello := clientHelloInfo("example.org", true)
-	if _, err := man1.GetCertificate(hello); err != nil {
-		t.Error(err)
-	}
-	if _, err := man2.GetCertificate(hello); err != nil {
-		t.Error(err)
-	}
-}
-
-func TestGetCertificate_tokenCache(t *testing.T) {
-	t.Run("ecdsaSupport=true", func(t *testing.T) {
-		testGetCertificate_tokenCache(t, true)
-	})
-	t.Run("ecdsaSupport=false", func(t *testing.T) {
-		testGetCertificate_tokenCache(t, false)
-	})
-}
-
-func TestGetCertificate_ecdsaVsRSA(t *testing.T) {
-	cache := newMemCache(t)
-	man := &Manager{Prompt: AcceptTOS, Cache: cache}
-	defer man.stopRenew()
-	url, finish := startACMEServerStub(t, getCertificateFromManager(man, true), "example.org")
-	defer finish()
-	man.Client = &acme.Client{DirectoryURL: url}
-
-	cert, err := man.GetCertificate(clientHelloInfo("example.org", true))
-	if err != nil {
-		t.Error(err)
-	}
-	if _, ok := cert.Leaf.PublicKey.(*ecdsa.PublicKey); !ok {
-		t.Error("an ECDSA client was served a non-ECDSA certificate")
-	}
-
-	cert, err = man.GetCertificate(clientHelloInfo("example.org", false))
-	if err != nil {
-		t.Error(err)
-	}
-	if _, ok := cert.Leaf.PublicKey.(*rsa.PublicKey); !ok {
-		t.Error("a RSA client was served a non-RSA certificate")
-	}
-
-	if _, err := man.GetCertificate(clientHelloInfo("example.org", true)); err != nil {
-		t.Error(err)
-	}
-	if _, err := man.GetCertificate(clientHelloInfo("example.org", false)); err != nil {
-		t.Error(err)
-	}
-	if numCerts := cache.numCerts(); numCerts != 2 {
-		t.Errorf("found %d certificates in cache; want %d", numCerts, 2)
-	}
-}
-
-func TestGetCertificate_wrongCacheKeyType(t *testing.T) {
-	cache := newMemCache(t)
-	man := &Manager{Prompt: AcceptTOS, Cache: cache}
-	defer man.stopRenew()
-	url, finish := startACMEServerStub(t, getCertificateFromManager(man, true), exampleDomain)
-	defer finish()
-	man.Client = &acme.Client{DirectoryURL: url}
-
-	// Make an RSA cert and cache it without suffix.
-	pk, err := rsa.GenerateKey(rand.Reader, 512)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: exampleDomain},
-		NotAfter:     time.Now().Add(90 * 24 * time.Hour),
-	}
-	pub, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &pk.PublicKey, pk)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rsaCert := &tls.Certificate{
-		Certificate: [][]byte{pub},
-		PrivateKey:  pk,
-	}
-	if err := man.cachePut(context.Background(), exampleCertKey, rsaCert); err != nil {
-		t.Fatalf("man.cachePut: %v", err)
-	}
-
-	// The RSA cached cert should be silently ignored and replaced.
-	cert, err := man.GetCertificate(clientHelloInfo(exampleDomain, true))
-	if err != nil {
-		t.Error(err)
-	}
-	if _, ok := cert.Leaf.PublicKey.(*ecdsa.PublicKey); !ok {
-		t.Error("an ECDSA client was served a non-ECDSA certificate")
-	}
-	if numCerts := cache.numCerts(); numCerts != 1 {
-		t.Errorf("found %d certificates in cache; want %d", numCerts, 1)
-	}
-}
-
-func getCertificateFromManager(man *Manager, ecdsaSupport bool) func(string) error {
-	return func(sni string) error {
-		_, err := man.GetCertificate(clientHelloInfo(sni, ecdsaSupport))
-		return err
-	}
-}
-
-// startACMEServerStub runs an ACME server
-// The domain argument is the expected domain name of a certificate request.
-// TODO: Drop this in favour of x/crypto/acme/autocert/internal/acmetest.
-func startACMEServerStub(t *testing.T, getCertificate func(string) error, domain string) (url string, finish func()) {
-	// echo token-02 | shasum -a 256
-	// then divide result in 2 parts separated by dot
-	tokenCertName := "4e8eb87631187e9ff2153b56b13a4dec.13a35d002e485d60ff37354b32f665d9.token.acme.invalid"
-	verifyTokenCert := func() {
-		if err := getCertificate(tokenCertName); err != nil {
-			t.Errorf("verifyTokenCert: GetCertificate(%q): %v", tokenCertName, err)
-			return
-		}
-	}
-
-	// ACME CA server stub
-	var ca *httptest.Server
-	ca = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Replay-Nonce", "nonce")
-		if r.Method == "HEAD" {
-			// a nonce request
-			return
-		}
-
-		switch r.URL.Path {
-		// discovery
-		case "/":
-			if err := discoTmpl.Execute(w, ca.URL); err != nil {
-				t.Errorf("discoTmpl: %v", err)
-			}
-		// client key registration
-		case "/new-reg":
-			w.Write([]byte("{}"))
-		// domain authorization
-		case "/new-authz":
-			w.Header().Set("Location", ca.URL+"/authz/1")
-			w.WriteHeader(http.StatusCreated)
-			if err := authzTmpl.Execute(w, ca.URL); err != nil {
-				t.Errorf("authzTmpl: %v", err)
-			}
-		// accept tls-sni-02 challenge
-		case "/challenge/2":
-			verifyTokenCert()
-			w.Write([]byte("{}"))
-		// authorization status
-		case "/authz/1":
-			w.Write([]byte(`{"status": "valid"}`))
-		// cert request
-		case "/new-cert":
-			var req struct {
-				CSR string `json:"csr"`
-			}
-			decodePayload(&req, r.Body)
-			b, _ := base64.RawURLEncoding.DecodeString(req.CSR)
-			csr, err := x509.ParseCertificateRequest(b)
-			if err != nil {
-				t.Errorf("new-cert: CSR: %v", err)
-			}
-			if csr.Subject.CommonName != domain {
-				t.Errorf("CommonName in CSR = %q; want %q", csr.Subject.CommonName, domain)
-			}
-			der, err := dummyCert(csr.PublicKey, domain)
-			if err != nil {
-				t.Errorf("new-cert: dummyCert: %v", err)
-			}
-			chainUp := fmt.Sprintf("<%s/ca-cert>; rel=up", ca.URL)
-			w.Header().Set("Link", chainUp)
-			w.WriteHeader(http.StatusCreated)
-			w.Write(der)
-		// CA chain cert
-		case "/ca-cert":
-			der, err := dummyCert(nil, "ca")
-			if err != nil {
-				t.Errorf("ca-cert: dummyCert: %v", err)
-			}
-			w.Write(der)
-		default:
-			t.Errorf("unrecognized r.URL.Path: %s", r.URL.Path)
-		}
-	}))
-	finish = func() {
-		ca.Close()
-
-		// make sure token cert was removed
-		cancel := make(chan struct{})
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			tick := time.NewTicker(100 * time.Millisecond)
-			defer tick.Stop()
-			for {
-				if err := getCertificate(tokenCertName); err != nil {
-					return
-				}
-				select {
-				case <-tick.C:
-				case <-cancel:
-					return
-				}
-			}
-		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			close(cancel)
-			t.Error("token cert was not removed")
-			<-done
-		}
-	}
-	return ca.URL, finish
-}
-
-// tests man.GetCertificate flow using the provided hello argument.
-// The domain argument is the expected domain name of a certificate request.
-func testGetCertificate(t *testing.T, man *Manager, domain string, hello *tls.ClientHelloInfo) {
-	url, finish := startACMEServerStub(t, getCertificateFromManager(man, true), domain)
-	defer finish()
-	man.Client = &acme.Client{DirectoryURL: url}
-
-	// simulate tls.Config.GetCertificate
-	var tlscert *tls.Certificate
-	var err error
-	done := make(chan struct{})
-	go func() {
-		tlscert, err = man.GetCertificate(hello)
-		close(done)
-	}()
-	select {
-	case <-time.After(time.Minute):
-		t.Fatal("man.GetCertificate took too long to return")
-	case <-done:
-	}
-	if err != nil {
-		t.Fatalf("man.GetCertificate: %v", err)
-	}
-
-	// verify the tlscert is the same we responded with from the CA stub
-	if len(tlscert.Certificate) == 0 {
-		t.Fatal("len(tlscert.Certificate) is 0")
-	}
-	cert, err := x509.ParseCertificate(tlscert.Certificate[0])
-	if err != nil {
-		t.Fatalf("x509.ParseCertificate: %v", err)
-	}
-	if len(cert.DNSNames) == 0 || cert.DNSNames[0] != domain {
-		t.Errorf("cert.DNSNames = %v; want %q", cert.DNSNames, domain)
-	}
-
-}
-
-func TestVerifyHTTP01(t *testing.T) {
-	var (
-		http01 http.Handler
-
-		authzCount      int // num. of created authorizations
-		didAcceptHTTP01 bool
-	)
-
-	verifyHTTPToken := func() {
-		r := httptest.NewRequest("GET", "/.well-known/acme-challenge/token-http-01", nil)
-		w := httptest.NewRecorder()
-		http01.ServeHTTP(w, r)
-		if w.Code != http.StatusOK {
-			t.Errorf("http token: w.Code = %d; want %d", w.Code, http.StatusOK)
-		}
-		if v := w.Body.String(); !strings.HasPrefix(v, "token-http-01.") {
-			t.Errorf("http token value = %q; want 'token-http-01.' prefix", v)
-		}
-	}
-
-	// ACME CA server stub, only the needed bits.
-	// TODO: Replace this with x/crypto/acme/autocert/internal/acmetest.
-	var ca *httptest.Server
-	ca = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Replay-Nonce", "nonce")
-		if r.Method == "HEAD" {
-			// a nonce request
-			return
-		}
-
-		switch r.URL.Path {
-		// Discovery.
-		case "/":
-			if err := discoTmpl.Execute(w, ca.URL); err != nil {
-				t.Errorf("discoTmpl: %v", err)
-			}
-		// Client key registration.
-		case "/new-reg":
-			w.Write([]byte("{}"))
-		// New domain authorization.
-		case "/new-authz":
-			authzCount++
-			w.Header().Set("Location", fmt.Sprintf("%s/authz/%d", ca.URL, authzCount))
-			w.WriteHeader(http.StatusCreated)
-			if err := authzTmpl.Execute(w, ca.URL); err != nil {
-				t.Errorf("authzTmpl: %v", err)
-			}
-		// Accept tls-sni-02.
-		case "/challenge/2":
-			w.Write([]byte("{}"))
-		// Reject tls-sni-01.
-		case "/challenge/1":
-			http.Error(w, "won't accept tls-sni-01", http.StatusBadRequest)
-		// Should not accept dns-01.
-		case "/challenge/dns-01":
-			t.Errorf("dns-01 challenge was accepted")
-			http.Error(w, "won't accept dns-01", http.StatusBadRequest)
-		// Accept http-01.
-		case "/challenge/http-01":
-			didAcceptHTTP01 = true
-			verifyHTTPToken()
-			w.Write([]byte("{}"))
-		// Authorization statuses.
-		// Make tls-sni-xxx invalid.
-		case "/authz/1", "/authz/2":
-			w.Write([]byte(`{"status": "invalid"}`))
-		case "/authz/3", "/authz/4":
-			w.Write([]byte(`{"status": "valid"}`))
-		default:
-			http.NotFound(w, r)
-			t.Errorf("unrecognized r.URL.Path: %s", r.URL.Path)
-		}
-	}))
-	defer ca.Close()
-
-	m := &Manager{
-		Client: &acme.Client{
-			DirectoryURL: ca.URL,
-		},
-	}
-	http01 = m.HTTPHandler(nil)
-	ctx := context.Background()
-	client, err := m.acmeClient(ctx)
-	if err != nil {
-		t.Fatalf("m.acmeClient: %v", err)
-	}
-	if err := m.verify(ctx, client, "example.org"); err != nil {
-		t.Errorf("m.verify: %v", err)
-	}
-	// Only tls-sni-01, tls-sni-02 and http-01 must be accepted
-	// The dns-01 challenge is unsupported.
-	if authzCount != 3 {
-		t.Errorf("authzCount = %d; want 3", authzCount)
-	}
-	if !didAcceptHTTP01 {
-		t.Error("did not accept http-01 challenge")
-	}
-}
-
 func TestRevokeFailedAuthz(t *testing.T) {
-	// Prefill authorization URIs expected to be revoked.
-	// The challenges are selected in a specific order,
-	// each tried within a newly created authorization.
-	// This means each authorization URI corresponds to a different challenge type.
-	revokedAuthz := map[string]bool{
-		"/authz/0": false, // tls-sni-02
-		"/authz/1": false, // tls-sni-01
-		"/authz/2": false, // no viable challenge, but authz is created
+	ca := acmetest.NewCAServer(t)
+	// Make the authz unfulfillable on the client side, so it will be left
+	// pending at the end of the verification attempt.
+	ca.ChallengeTypes("fake-01", "fake-02")
+	ca.Start()
+
+	m := testManager(t)
+	m.Client = &acme.Client{DirectoryURL: ca.URL()}
+
+	_, err := m.GetCertificate(clientHelloInfo("example.org", algECDSA))
+	if err == nil {
+		t.Fatal("expected GetCertificate to fail")
 	}
 
-	var authzCount int          // num. of created authorizations
-	var revokeCount int         // num. of revoked authorizations
-	done := make(chan struct{}) // closed when revokeCount is 3
-
-	// ACME CA server stub, only the needed bits.
-	// TODO: Replace this with x/crypto/acme/autocert/internal/acmetest.
-	var ca *httptest.Server
-	ca = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Replay-Nonce", "nonce")
-		if r.Method == "HEAD" {
-			// a nonce request
+	start := time.Now()
+	for time.Since(start) < 3*time.Second {
+		authz, err := m.Client.GetAuthorization(context.Background(), ca.URL()+"/authz/0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if authz.Status == acme.StatusDeactivated {
 			return
 		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Error("revocations took too long")
 
-		switch r.URL.Path {
-		// Discovery.
-		case "/":
-			if err := discoTmpl.Execute(w, ca.URL); err != nil {
-				t.Errorf("discoTmpl: %v", err)
-			}
-		// Client key registration.
-		case "/new-reg":
-			w.Write([]byte("{}"))
-		// New domain authorization.
-		case "/new-authz":
-			w.Header().Set("Location", fmt.Sprintf("%s/authz/%d", ca.URL, authzCount))
-			w.WriteHeader(http.StatusCreated)
-			if err := authzTmpl.Execute(w, ca.URL); err != nil {
-				t.Errorf("authzTmpl: %v", err)
-			}
-			authzCount++
-		// tls-sni-02 challenge "accept" request.
-		case "/challenge/2":
-			// Refuse.
-			http.Error(w, "won't accept tls-sni-02 challenge", http.StatusBadRequest)
-		// tls-sni-01 challenge "accept" request.
-		case "/challenge/1":
-			// Accept but the authorization will be "expired".
-			w.Write([]byte("{}"))
-		// Authorization requests.
-		case "/authz/0", "/authz/1", "/authz/2":
-			// Revocation requests.
-			if r.Method == "POST" {
-				var req struct{ Status string }
-				if err := decodePayload(&req, r.Body); err != nil {
-					t.Errorf("%s: decodePayload: %v", r.URL, err)
-				}
-				switch req.Status {
-				case "deactivated":
-					revokedAuthz[r.URL.Path] = true
-					revokeCount++
-					if revokeCount >= 3 {
-						// Last authorization is revoked.
-						defer close(done)
-					}
-				default:
-					t.Errorf("%s: req.Status = %q; want 'deactivated'", r.URL, req.Status)
-				}
-				w.Write([]byte(`{"status": "invalid"}`))
-				return
-			}
-			// Authorization status requests.
-			// Simulate abandoned authorization, deleted by the CA.
-			w.WriteHeader(http.StatusNotFound)
-		default:
-			http.NotFound(w, r)
-			t.Errorf("unrecognized r.URL.Path: %s", r.URL.Path)
-		}
-	}))
-	defer ca.Close()
-
-	m := &Manager{
-		Client: &acme.Client{DirectoryURL: ca.URL},
-	}
-	// Should fail and revoke 3 authorizations.
-	// The first 2 are tsl-sni-02 and tls-sni-01 challenges.
-	// The third time an authorization is created but no viable challenge is found.
-	// See revokedAuthz above for more explanation.
-	if _, err := m.createCert(context.Background(), exampleCertKey); err == nil {
-		t.Errorf("m.createCert returned nil error")
-	}
-	select {
-	case <-time.After(3 * time.Second):
-		t.Error("revocations took too long")
-	case <-done:
-		// revokeCount is at least 3.
-	}
-	for uri, ok := range revokedAuthz {
-		if !ok {
-			t.Errorf("%q authorization was not revoked", uri)
-		}
-	}
 }
 
 func TestHTTPHandlerDefaultFallback(t *testing.T) {
@@ -906,13 +670,14 @@ func TestCache(t *testing.T) {
 }
 
 func TestHostWhitelist(t *testing.T) {
-	policy := HostWhitelist("example.com", "example.org", "*.example.net")
+	policy := HostWhitelist("example.com", "EXAMPLE.ORG", "*.example.net", "éÉ.com")
 	tt := []struct {
 		host  string
 		allow bool
 	}{
 		{"example.com", true},
 		{"example.org", true},
+		{"xn--9caa.com", true}, // éé.com
 		{"one.example.com", false},
 		{"two.example.org", false},
 		{"three.example.net", false},
@@ -1035,7 +800,7 @@ func TestManagerGetCertificateBogusSNI(t *testing.T) {
 		{"fo.o", "cache.Get of fo.o"},
 	}
 	for _, tt := range tests {
-		_, err := m.GetCertificate(clientHelloInfo(tt.name, true))
+		_, err := m.GetCertificate(clientHelloInfo(tt.name, algECDSA))
 		got := fmt.Sprint(err)
 		if got != tt.wantErr {
 			t.Errorf("GetCertificate(SNI = %q) = %q; want %q", tt.name, got, tt.wantErr)
@@ -1053,7 +818,7 @@ func TestCertRequest(t *testing.T) {
 		Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1},
 		Value: []byte("dummy"),
 	}
-	b, err := certRequest(key, "example.org", []pkix.Extension{ext}, "san.example.org")
+	b, err := certRequest(key, "example.org", []pkix.Extension{ext})
 	if err != nil {
 		t.Fatalf("certRequest: %v", err)
 	}
@@ -1132,18 +897,16 @@ func TestSupportsECDSA(t *testing.T) {
 	}
 }
 
-// TODO: add same end-to-end for http-01 challenge type.
-func TestEndToEnd(t *testing.T) {
+func TestEndToEndALPN(t *testing.T) {
 	const domain = "example.org"
 
 	// ACME CA server
-	ca := acmetest.NewCAServer([]string{"tls-alpn-01"}, []string{domain})
-	defer ca.Close()
+	ca := acmetest.NewCAServer(t).Start()
 
-	// User dummy server.
+	// User HTTPS server.
 	m := &Manager{
 		Prompt: AcceptTOS,
-		Client: &acme.Client{DirectoryURL: ca.URL},
+		Client: &acme.Client{DirectoryURL: ca.URL()},
 	}
 	us := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("OK"))
@@ -1165,17 +928,70 @@ func TestEndToEnd(t *testing.T) {
 	// where to dial to instead.
 	ca.Resolve(domain, strings.TrimPrefix(us.URL, "https://"))
 
-	// A client visiting user dummy server.
+	// A client visiting user's HTTPS server.
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
-			RootCAs:    ca.Roots,
+			RootCAs:    ca.Roots(),
 			ServerName: domain,
 		},
 	}
 	client := &http.Client{Transport: tr}
 	res, err := client.Get(us.URL)
 	if err != nil {
-		t.Logf("CA errors: %v", ca.Errors())
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	b, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := string(b); v != "OK" {
+		t.Errorf("user server response: %q; want 'OK'", v)
+	}
+}
+
+func TestEndToEndHTTP(t *testing.T) {
+	const domain = "example.org"
+
+	// ACME CA server.
+	ca := acmetest.NewCAServer(t).ChallengeTypes("http-01").Start()
+
+	// User HTTP server for the ACME challenge.
+	m := testManager(t)
+	m.Client = &acme.Client{DirectoryURL: ca.URL()}
+	s := httptest.NewServer(m.HTTPHandler(nil))
+	defer s.Close()
+
+	// User HTTPS server.
+	ss := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK"))
+	}))
+	ss.TLS = &tls.Config{
+		NextProtos: []string{"http/1.1", acme.ALPNProto},
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			cert, err := m.GetCertificate(hello)
+			if err != nil {
+				t.Errorf("m.GetCertificate: %v", err)
+			}
+			return cert, err
+		},
+	}
+	ss.StartTLS()
+	defer ss.Close()
+
+	// Redirect the CA requests to the HTTP server.
+	ca.Resolve(domain, strings.TrimPrefix(s.URL, "http://"))
+
+	// A client visiting user's HTTPS server.
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			RootCAs:    ca.Roots(),
+			ServerName: domain,
+		},
+	}
+	client := &http.Client{Transport: tr}
+	res, err := client.Get(ss.URL)
+	if err != nil {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()

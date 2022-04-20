@@ -5,6 +5,8 @@
 package ssh
 
 import (
+	"bytes"
+	"crypto/rand"
 	"strings"
 	"testing"
 )
@@ -116,6 +118,45 @@ func TestHostKeyCheck(t *testing.T) {
 	}
 }
 
+func TestVerifyHostKeySignature(t *testing.T) {
+	for _, tt := range []struct {
+		key        string
+		signAlgo   string
+		verifyAlgo string
+		wantError  string
+	}{
+		{"rsa", KeyAlgoRSA, KeyAlgoRSA, ""},
+		{"rsa", KeyAlgoRSASHA256, KeyAlgoRSASHA256, ""},
+		{"rsa", KeyAlgoRSA, KeyAlgoRSASHA512, `ssh: invalid signature algorithm "ssh-rsa", expected "rsa-sha2-512"`},
+		{"ed25519", KeyAlgoED25519, KeyAlgoED25519, ""},
+	} {
+		key := testSigners[tt.key].PublicKey()
+		s, ok := testSigners[tt.key].(AlgorithmSigner)
+		if !ok {
+			t.Fatalf("needed an AlgorithmSigner")
+		}
+		sig, err := s.SignWithAlgorithm(rand.Reader, []byte("test"), tt.signAlgo)
+		if err != nil {
+			t.Fatalf("couldn't sign: %q", err)
+		}
+
+		b := bytes.Buffer{}
+		writeString(&b, []byte(sig.Format))
+		writeString(&b, sig.Blob)
+
+		result := kexResult{Signature: b.Bytes(), H: []byte("test")}
+
+		err = verifyHostKeySignature(key, tt.verifyAlgo, &result)
+		if err != nil {
+			if tt.wantError == "" || !strings.Contains(err.Error(), tt.wantError) {
+				t.Errorf("got error %q, expecting %q", err.Error(), tt.wantError)
+			}
+		} else if tt.wantError != "" {
+			t.Errorf("succeeded, but want error string %q", tt.wantError)
+		}
+	}
+}
+
 func TestBannerCallback(t *testing.T) {
 	c1, c2, err := netPipe()
 	if err != nil {
@@ -162,5 +203,54 @@ func TestBannerCallback(t *testing.T) {
 	expected := "Hello World"
 	if receivedBanner != expected {
 		t.Fatalf("got %s; want %s", receivedBanner, expected)
+	}
+}
+
+func TestNewClientConn(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		user string
+	}{
+		{
+			name: "good user field for ConnMetadata",
+			user: "testuser",
+		},
+		{
+			name: "empty user field for ConnMetadata",
+			user: "",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c1, c2, err := netPipe()
+			if err != nil {
+				t.Fatalf("netPipe: %v", err)
+			}
+			defer c1.Close()
+			defer c2.Close()
+
+			serverConf := &ServerConfig{
+				PasswordCallback: func(conn ConnMetadata, password []byte) (*Permissions, error) {
+					return &Permissions{}, nil
+				},
+			}
+			serverConf.AddHostKey(testSigners["rsa"])
+			go NewServerConn(c1, serverConf)
+
+			clientConf := &ClientConfig{
+				User: tt.user,
+				Auth: []AuthMethod{
+					Password("testpw"),
+				},
+				HostKeyCallback: InsecureIgnoreHostKey(),
+			}
+			clientConn, _, _, err := NewClientConn(c2, "", clientConf)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if userGot := clientConn.User(); userGot != tt.user {
+				t.Errorf("got user %q; want user %q", userGot, tt.user)
+			}
+		})
 	}
 }
